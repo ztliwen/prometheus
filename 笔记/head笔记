@@ -1,0 +1,193 @@
+func NewHead(r prometheus.Registerer, l log.Logger, wal, wbl *wlog.WL, opts *HeadOptions, stats *HeadStats) (*Head, error) {
+	var err error
+	if l == nil {
+		l = log.NewNopLogger()
+	}
+
+	if opts.OutOfOrderTimeWindow.Load() < 0 {
+		opts.OutOfOrderTimeWindow.Store(0)
+	}
+
+	// Time window can be set on runtime. So the capMin and capMax should be valid
+	// even if ooo is not enabled yet.
+	capMax := opts.OutOfOrderCapMax.Load()
+	if capMax <= 0 || capMax > 255 {
+		return nil, errors.Errorf("OOOCapMax of %d is invalid. must be > 0 and <= 255", capMax)
+	}
+
+	if opts.ChunkRange < 1 {
+		return nil, errors.Errorf("invalid chunk range %d", opts.ChunkRange)
+	}
+	if opts.SeriesCallback == nil {
+		opts.SeriesCallback = &noopSeriesLifecycleCallback{}
+	}
+
+	if stats == nil {
+		stats = NewHeadStats()
+	}
+
+	if !opts.EnableExemplarStorage {
+		opts.MaxExemplars.Store(0)
+	}
+
+	h := &Head{
+		wal:    wal,
+		wbl:    wbl,
+		logger: l,
+		opts:   opts,
+		memChunkPool: sync.Pool{
+			New: func() interface{} {
+				return &memChunk{}
+			},
+		},
+		stats: stats,
+		reg:   r,
+	}
+	if err := h.resetInMemoryState(); err != nil {
+		return nil, err
+	}
+	h.metrics = newHeadMetrics(h, r)
+
+	if opts.ChunkPool == nil {
+		opts.ChunkPool = chunkenc.NewPool()
+	}
+
+	if opts.WALReplayConcurrency <= 0 {
+		opts.WALReplayConcurrency = defaultWALReplayConcurrency
+	}
+
+	h.chunkDiskMapper, err = chunks.NewChunkDiskMapper(
+		r,
+		mmappedChunksDir(opts.ChunkDirRoot),
+		opts.ChunkPool,
+		opts.ChunkWriteBufferSize,
+		opts.ChunkWriteQueueSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return h, nil
+}
+
+// Appender returns a new Appender on the database.
+func (h *Head) Appender(_ context.Context) storage.Appender {
+	h.metrics.activeAppenders.Inc()
+
+	// The head cache might not have a starting point yet. The init appender
+	// picks up the first appended timestamp as the base.
+	if h.MinTime() == math.MaxInt64 {
+		return &initAppender{
+			head: h,
+		}
+	}
+	return h.appender()
+}
+
+func (h *Head) appender() *headAppender {
+	minValidTime := h.appendableMinValidTime()
+	appendID, cleanupAppendIDsBelow := h.iso.newAppendID(minValidTime) // Every appender gets an ID that is cleared upon commit/rollback.
+
+	// Allocate the exemplars buffer only if exemplars are enabled.
+	var exemplarsBuf []exemplarWithSeriesRef
+	if h.opts.EnableExemplarStorage {
+		exemplarsBuf = h.getExemplarBuffer()
+	}
+
+	return &headAppender{
+		head:                  h,
+		minValidTime:          minValidTime,
+		mint:                  math.MaxInt64,
+		maxt:                  math.MinInt64,
+		headMaxt:              h.MaxTime(),
+		oooTimeWindow:         h.opts.OutOfOrderTimeWindow.Load(),
+		samples:               h.getAppendBuffer(),
+		sampleSeries:          h.getSeriesBuffer(),
+		exemplars:             exemplarsBuf,
+		histograms:            h.getHistogramBuffer(),
+		floatHistograms:       h.getFloatHistogramBuffer(),
+		metadata:              h.getMetadataBuffer(),
+		appendID:              appendID,
+		cleanupAppendIDsBelow: cleanupAppendIDsBelow,
+	}
+}
+
+func (a *headAppender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+	// For OOO inserts, this restriction is irrelevant and will be checked later once we confirm the sample is an in-order append.
+	// If OOO inserts are disabled, we may as well as check this as early as we can and avoid more work.
+	if a.oooTimeWindow == 0 && t < a.minValidTime {
+		a.head.metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat).Inc()
+		return 0, storage.ErrOutOfBounds
+	}
+
+	s := a.head.series.getByID(chunks.HeadSeriesRef(ref))
+	if s == nil {
+		// Ensure no empty labels have gotten through.
+		lset = lset.WithoutEmpty()
+		if lset.IsEmpty() {
+			return 0, errors.Wrap(ErrInvalidSample, "empty labelset")
+		}
+
+		if l, dup := lset.HasDuplicateLabelNames(); dup {
+			return 0, errors.Wrap(ErrInvalidSample, fmt.Sprintf(`label name "%s" is not unique`, l))
+		}
+
+		var created bool
+		var err error
+		s, created, err = a.head.getOrCreate(lset.Hash(), lset)
+		if err != nil {
+			return 0, err
+		}
+		if created {
+			a.series = append(a.series, record.RefSeries{
+				Ref:    s.ref,
+				Labels: lset,
+			})
+		}
+	}
+
+	if value.IsStaleNaN(v) {
+		switch {
+		case s.lastHistogramValue != nil:
+			return a.AppendHistogram(ref, lset, t, &histogram.Histogram{Sum: v}, nil)
+		case s.lastFloatHistogramValue != nil:
+			return a.AppendHistogram(ref, lset, t, nil, &histogram.FloatHistogram{Sum: v})
+		}
+	}
+
+	s.Lock()
+	// TODO(codesome): If we definitely know at this point that the sample is ooo, then optimise
+	// to skip that sample from the WAL and write only in the WBL.
+	_, delta, err := s.appendable(t, v, a.headMaxt, a.minValidTime, a.oooTimeWindow)
+	if err == nil {
+		s.pendingCommit = true
+	}
+	s.Unlock()
+	if delta > 0 {
+		a.head.metrics.oooHistogram.Observe(float64(delta) / 1000)
+	}
+	if err != nil {
+		switch err {
+		case storage.ErrOutOfOrderSample:
+			a.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat).Inc()
+		case storage.ErrTooOldSample:
+			a.head.metrics.tooOldSamples.WithLabelValues(sampleMetricTypeFloat).Inc()
+		}
+		return 0, err
+	}
+
+	if t < a.mint {
+		a.mint = t
+	}
+	if t > a.maxt {
+		a.maxt = t
+	}
+
+	a.samples = append(a.samples, record.RefSample{
+		Ref: s.ref,
+		T:   t,
+		V:   v,
+	})
+	a.sampleSeries = append(a.sampleSeries, s)
+	return storage.SeriesRef(s.ref), nil
+}
