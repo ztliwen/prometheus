@@ -1,0 +1,38 @@
+
+func NewFanout(logger log.Logger, primary Storage, secondaries ...Storage) Storage {
+	return &fanout{
+		logger:      logger,
+		primary:     primary,
+		secondaries: secondaries,
+	}
+}
+
+func (f *fanout) Appender(ctx context.Context) Appender {
+	primary := f.primary.Appender(ctx)
+	secondaries := make([]Appender, 0, len(f.secondaries))
+	for _, storage := range f.secondaries {
+		secondaries = append(secondaries, storage.Appender(ctx))
+	}
+	return &fanoutAppender{
+		logger:      f.logger,
+		primary:     primary,
+		secondaries: secondaries,
+	}
+}
+
+// ref, err = app.Append(ref, lset, t, val)
+func (f *fanoutAppender) Append(ref SeriesRef, l labels.Labels, t int64, v float64) (SeriesRef, error) {
+	ref, err := f.primary.Append(ref, l, t, v)
+	if err != nil {
+		return ref, err
+	}
+
+	for _, appender := range f.secondaries {
+		if _, err := appender.Append(ref, l, t, v); err != nil {
+			return 0, err
+		}
+	}
+	return ref, nil
+}
+
+

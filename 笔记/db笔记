@@ -1,0 +1,346 @@
+
+
+db, err := openDBWithMetrics(localStoragePath, logger, prometheus.DefaultRegisterer, &opts, localStorage.getStats())
+
+
+func openDBWithMetrics(dir string, logger log.Logger, reg prometheus.Registerer, opts *tsdb.Options, stats *tsdb.DBStats) (*tsdb.DB, error) {
+	db, err := tsdb.Open(
+		dir,
+		log.With(logger, "component", "tsdb"),
+		reg,
+		opts,
+		stats,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	reg.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "prometheus_tsdb_lowest_timestamp_seconds",
+			Help: "Lowest timestamp value stored in the database.",
+		}, func() float64 {
+			bb := db.Blocks()
+			if len(bb) == 0 {
+				return float64(db.Head().MinTime() / 1000)
+			}
+			return float64(db.Blocks()[0].Meta().MinTime / 1000)
+		}), prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "prometheus_tsdb_head_min_time_seconds",
+			Help: "Minimum time bound of the head block.",
+		}, func() float64 { return float64(db.Head().MinTime() / 1000) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "prometheus_tsdb_head_max_time_seconds",
+			Help: "Maximum timestamp of the head block.",
+		}, func() float64 { return float64(db.Head().MaxTime() / 1000) }),
+	)
+
+	return db, nil
+}
+
+
+func Open(l log.Logger, reg prometheus.Registerer, rs *remote.Storage, dir string, opts *Options) (*DB, error) {
+	opts = validateOptions(opts)
+
+	locker, err := tsdbutil.NewDirLocker(dir, "agent", l, reg)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.NoLockfile {
+		if err := locker.Lock(); err != nil {
+			return nil, err
+		}
+	}
+
+	// remote_write expects WAL to be stored in a "wal" subdirectory of the main storage.
+	dir = filepath.Join(dir, "wal")
+
+	w, err := wlog.NewSize(l, reg, dir, opts.WALSegmentSize, opts.WALCompression)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating WAL")
+	}
+
+	db := &DB{
+		logger: l,
+		opts:   opts,
+		rs:     rs,
+
+		wal:    w,
+		locker: locker,
+
+		nextRef: atomic.NewUint64(0),
+		series:  newStripeSeries(opts.StripeSize),
+		deleted: make(map[chunks.HeadSeriesRef]int),
+
+		donec: make(chan struct{}),
+		stopc: make(chan struct{}),
+
+		metrics: newDBMetrics(reg),
+	}
+
+	db.bufPool.New = func() interface{} {
+		return make([]byte, 0, 1024)
+	}
+
+	db.appenderPool.New = func() interface{} {
+		return &appender{
+			DB:                     db,
+			pendingSeries:          make([]record.RefSeries, 0, 100),
+			pendingSamples:         make([]record.RefSample, 0, 100),
+			pendingHistograms:      make([]record.RefHistogramSample, 0, 100),
+			pendingFloatHistograms: make([]record.RefFloatHistogramSample, 0, 100),
+			pendingExamplars:       make([]record.RefExemplar, 0, 10),
+		}
+	}
+
+	if err := db.replayWAL(); err != nil {
+		level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+		if err := w.Repair(err); err != nil {
+			return nil, errors.Wrap(err, "repair corrupted WAL")
+		}
+		level.Info(db.logger).Log("msg", "successfully repaired WAL")
+	}
+
+	go db.run()
+	return db, nil
+}
+
+func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs []int64, stats *DBStats) (_ *DB, returnedErr error) {
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return nil, err
+	}
+	if l == nil {
+		l = log.NewNopLogger()
+	}
+	if stats == nil {
+		stats = NewDBStats()
+	}
+
+	for i, v := range rngs {
+		if v > opts.MaxBlockDuration {
+			rngs = rngs[:i]
+			break
+		}
+	}
+
+	// Fixup bad format written by Prometheus 2.1.
+	if err := repairBadIndexVersion(l, dir); err != nil {
+		return nil, errors.Wrap(err, "repair bad index version")
+	}
+
+	walDir := filepath.Join(dir, "wal")
+	wblDir := filepath.Join(dir, wlog.WblDirName)
+
+	// Migrate old WAL if one exists.
+	if err := MigrateWAL(l, walDir); err != nil {
+		return nil, errors.Wrap(err, "migrate WAL")
+	}
+	for _, tmpDir := range []string{walDir, dir} {
+		// Remove tmp dirs.
+		if err := removeBestEffortTmpDirs(l, tmpDir); err != nil {
+			return nil, errors.Wrap(err, "remove tmp dirs")
+		}
+	}
+
+	db := &DB{
+		dir:            dir,
+		logger:         l,
+		opts:           opts,
+		compactc:       make(chan struct{}, 1),
+		donec:          make(chan struct{}),
+		stopc:          make(chan struct{}),
+		autoCompact:    true,
+		chunkPool:      chunkenc.NewPool(),
+		blocksToDelete: opts.BlocksToDelete,
+		registerer:     r,
+	}
+	defer func() {
+		// Close files if startup fails somewhere.
+		if returnedErr == nil {
+			return
+		}
+
+		close(db.donec) // DB is never run if it was an error, so close this channel here.
+
+		returnedErr = tsdb_errors.NewMulti(
+			returnedErr,
+			errors.Wrap(db.Close(), "close DB after failed startup"),
+		).Err()
+	}()
+
+	if db.blocksToDelete == nil {
+		db.blocksToDelete = DefaultBlocksToDelete(db)
+	}
+
+	var err error
+	db.locker, err = tsdbutil.NewDirLocker(dir, "tsdb", db.logger, r)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.NoLockfile {
+		if err := db.locker.Lock(); err != nil {
+			return nil, err
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	db.compactor, err = NewLeveledCompactorWithChunkSize(ctx, r, l, rngs, db.chunkPool, opts.MaxBlockChunkSegmentSize, nil)
+	if err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "create leveled compactor")
+	}
+	db.compactCancel = cancel
+
+	var wal, wbl *wlog.WL
+	segmentSize := wlog.DefaultSegmentSize
+	// Wal is enabled.
+	if opts.WALSegmentSize >= 0 {
+		// Wal is set to a custom size.
+		if opts.WALSegmentSize > 0 {
+			segmentSize = opts.WALSegmentSize
+		}
+		wal, err = wlog.NewSize(l, r, walDir, segmentSize, opts.WALCompression)
+		if err != nil {
+			return nil, err
+		}
+		// Check if there is a WBL on disk, in which case we should replay that data.
+		wblSize, err := fileutil.DirSize(wblDir)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		if opts.OutOfOrderTimeWindow > 0 || wblSize > 0 {
+			wbl, err = wlog.NewSize(l, r, wblDir, segmentSize, opts.WALCompression)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	db.oooWasEnabled.Store(opts.OutOfOrderTimeWindow > 0)
+	headOpts := DefaultHeadOptions()
+	headOpts.ChunkRange = rngs[0]
+	headOpts.ChunkDirRoot = dir
+	headOpts.ChunkPool = db.chunkPool
+	headOpts.ChunkWriteBufferSize = opts.HeadChunksWriteBufferSize
+	headOpts.ChunkWriteQueueSize = opts.HeadChunksWriteQueueSize
+	headOpts.StripeSize = opts.StripeSize
+	headOpts.SeriesCallback = opts.SeriesLifecycleCallback
+	headOpts.EnableExemplarStorage = opts.EnableExemplarStorage
+	headOpts.MaxExemplars.Store(opts.MaxExemplars)
+	headOpts.EnableMemorySnapshotOnShutdown = opts.EnableMemorySnapshotOnShutdown
+	headOpts.EnableNativeHistograms.Store(opts.EnableNativeHistograms)
+	headOpts.OutOfOrderTimeWindow.Store(opts.OutOfOrderTimeWindow)
+	headOpts.OutOfOrderCapMax.Store(opts.OutOfOrderCapMax)
+	if opts.WALReplayConcurrency > 0 {
+		headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
+	}
+	if opts.IsolationDisabled {
+		// We only override this flag if isolation is disabled at DB level. We use the default otherwise.
+		headOpts.IsolationDisabled = opts.IsolationDisabled
+	}
+	db.head, err = NewHead(r, l, wal, wbl, headOpts, stats.Head)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register metrics after assigning the head block.
+	db.metrics = newDBMetrics(db, r)
+	maxBytes := opts.MaxBytes
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	db.metrics.maxBytes.Set(float64(maxBytes))
+
+	if err := db.reload(); err != nil {
+		return nil, err
+	}
+	// Set the min valid time for the ingested samples
+	// to be no lower than the maxt of the last block.
+	minValidTime := int64(math.MinInt64)
+	// We do not consider blocks created from out-of-order samples for Head's minValidTime
+	// since minValidTime is only for the in-order data and we do not want to discard unnecessary
+	// samples from the Head.
+	inOrderMaxTime, ok := db.inOrderBlocksMaxTime()
+	if ok {
+		minValidTime = inOrderMaxTime
+	}
+
+	if initErr := db.head.Init(minValidTime); initErr != nil {
+		db.head.metrics.walCorruptionsTotal.Inc()
+		isOOOErr := isErrLoadOOOWal(initErr)
+		if isOOOErr {
+			level.Warn(db.logger).Log("msg", "Encountered OOO WAL read error, attempting repair", "err", initErr)
+			if err := wbl.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted OOO WAL")
+			}
+			level.Info(db.logger).Log("msg", "Successfully repaired OOO WAL")
+		} else {
+			level.Warn(db.logger).Log("msg", "Encountered WAL read error, attempting repair", "err", initErr)
+			if err := wal.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+			level.Info(db.logger).Log("msg", "Successfully repaired WAL")
+		}
+	}
+
+	if db.head.MinOOOTime() != int64(math.MaxInt64) {
+		// Some OOO data was replayed from the disk that needs compaction and cleanup.
+		db.oooWasEnabled.Store(true)
+	}
+
+	go db.run()
+
+	return db, nil
+}
+
+// 最终调用方法
+// ref, err = app.Append(ref, lset, t, val) 
+func (a *appender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+	// series references and chunk references are identical for agent mode.
+	headRef := chunks.HeadSeriesRef(ref)
+
+	series := a.series.GetByID(headRef)
+	if series == nil {
+		// Ensure no empty or duplicate labels have gotten through. This mirrors the
+		// equivalent validation code in the TSDB's headAppender.
+		l = l.WithoutEmpty()
+		if l.IsEmpty() {
+			return 0, errors.Wrap(tsdb.ErrInvalidSample, "empty labelset")
+		}
+
+		if lbl, dup := l.HasDuplicateLabelNames(); dup {
+			return 0, errors.Wrap(tsdb.ErrInvalidSample, fmt.Sprintf(`label name "%s" is not unique`, lbl))
+		}
+
+		var created bool
+		series, created = a.getOrCreate(l)
+		if created {
+			a.pendingSeries = append(a.pendingSeries, record.RefSeries{
+				Ref:    series.ref,
+				Labels: l,
+			})
+
+			a.metrics.numActiveSeries.Inc()
+		}
+	}
+
+	series.Lock()
+	defer series.Unlock()
+
+	if t < series.lastTs {
+		a.metrics.totalOutOfOrderSamples.Inc()
+		return 0, storage.ErrOutOfOrderSample
+	}
+
+	// NOTE: always modify pendingSamples and sampleSeries together.
+	a.pendingSamples = append(a.pendingSamples, record.RefSample{
+		Ref: series.ref,
+		T:   t,
+		V:   v,
+	})
+	a.sampleSeries = append(a.sampleSeries, series)
+
+	a.metrics.totalAppendedSamples.WithLabelValues(sampleMetricTypeFloat).Inc()
+	return storage.SeriesRef(series.ref), nil
+}
+
+
