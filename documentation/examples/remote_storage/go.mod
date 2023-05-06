@@ -10,7 +10,7 @@ require (
 	github.com/influxdata/influxdb v1.11.0
 	github.com/prometheus/client_golang v1.14.0
 	github.com/prometheus/common v0.42.0
-	github.com/prometheus/prometheus v0.43.0
+	github.com/prometheus/prometheus v0.43.1
 	github.com/stretchr/testify v1.8.2
 )
 
